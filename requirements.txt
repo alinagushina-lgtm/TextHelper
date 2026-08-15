@@ -1,0 +1,8 @@
+pystray
+pillow
+pyperclip
+
+# Голосовой ввод
+sherpa-onnx
+sounddevice
+numpy
