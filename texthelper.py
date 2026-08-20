@@ -108,13 +108,29 @@ def build_first_prompt(action_prompt, text):
     )
 
 
-def build_refine_prompt(action_prompt, original, previous, note):
+def build_image_prompt(action_prompt, image_path):
+    """Текста у нас нет — он на картинке, и прочитать её должен сам Claude."""
+    return (
+        f"Прочитай весь текст с картинки {image_path.name} "
+        "(она лежит в текущей папке) и выполни с ним задачу.\n\n"
+        f"Задача: {action_prompt}\n\n"
+        "Верни только готовый текст — без описания картинки и без пояснений."
+    )
+
+
+def build_refine_prompt(action_prompt, original, previous, note, image_path=None):
     """Полный контекст в каждом запросе: claude -p не помнит прошлых вызовов."""
+    if image_path is not None:
+        source = (
+            f"Исходный текст находится на картинке {image_path.name} "
+            "в текущей папке — при необходимости перечитай её."
+        )
+    else:
+        source = f"=== ИСХОДНЫЙ ТЕКСТ ===\n{original}\n=== КОНЕЦ ==="
+
     return (
         f"Исходная задача: {action_prompt}\n\n"
-        "=== ИСХОДНЫЙ ТЕКСТ ===\n"
-        f"{original}\n"
-        "=== КОНЕЦ ===\n\n"
+        f"{source}\n\n"
         "=== ПРЕДЫДУЩИЙ РЕЗУЛЬТАТ ===\n"
         f"{previous}\n"
         "=== КОНЕЦ ===\n\n"
@@ -133,8 +149,13 @@ def clean_response(text):
     return text
 
 
-def run_claude(prompt, model, timeout):
-    """Запускает claude -p и возвращает готовый текст."""
+def run_claude(prompt, model, timeout, image_path=None):
+    """Запускает claude -p и возвращает готовый текст.
+
+    Для обычного текста инструменты отключены полностью — так быстрее и
+    безопаснее. Для картинки разрешаем единственный инструмент чтения:
+    иначе Claude не сможет её открыть.
+    """
     executable = find_claude()
     if executable is None:
         raise ClaudeError(
@@ -143,17 +164,27 @@ def run_claude(prompt, model, timeout):
             f"{Path.home() / '.local' / 'bin' / 'claude.exe'}"
         )
 
+    if image_path is None:
+        # Текст обрабатывается без инструментов — быстрее и не лезет в файлы.
+        access = ["--tools", ""]
+    else:
+        # Картинку нужно открыть, поэтому разрешаем единственный инструмент —
+        # чтение файла, и заранее подтверждаем его, чтобы не ждать вопроса.
+        access = ["--allowed-tools", "Read", "--permission-mode", "acceptEdits"]
+
     command = [
         executable, "-p",
         "--model", model,
-        "--tools", "",
+        *access,
         "--strict-mcp-config",
         "--system-prompt", SYSTEM_PROMPT,
     ]
 
     # Отдельная временная папка, чтобы Claude Code не подхватил CLAUDE.md
-    # и настройки постороннего проекта.
-    with tempfile.TemporaryDirectory(prefix="texthelper-") as workdir:
+    # и настройки постороннего проекта. Для картинки работаем в её папке,
+    # иначе Claude до файла не дотянется.
+    with tempfile.TemporaryDirectory(prefix="texthelper-") as tempdir:
+        workdir = str(image_path.parent) if image_path is not None else tempdir
         try:
             completed = subprocess.run(
                 command,
@@ -321,15 +352,59 @@ def _send_ctrl_c():
     _user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
 
 
-def grab_text(previous_hwnd, timeout=0.8):
-    """Берёт выделенный текст из окна, где работал пользователь.
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
+
+
+def clipboard_image():
+    """Картинка из буфера обмена, если она там есть.
+
+    Туда она попадает после Win+Shift+S, PrintScreen или копирования
+    файла с картинкой в проводнике.
+    """
+    try:
+        from PIL import ImageGrab
+        content = ImageGrab.grabclipboard()
+    except Exception:
+        log.exception("Не удалось прочитать картинку из буфера обмена")
+        return None
+
+    if isinstance(content, list):
+        # Скопирован файл в проводнике — берём первый, если это картинка.
+        for name in content:
+            path = Path(name)
+            if path.suffix.lower() in IMAGE_SUFFIXES and path.exists():
+                try:
+                    from PIL import Image
+                    return Image.open(path)
+                except Exception:
+                    log.exception("Не удалось открыть %s", path)
+        return None
+
+    return content if content is not None and hasattr(content, "save") else None
+
+
+def save_clipboard_image(image):
+    """Кладёт картинку в файл рядом с настройками — Claude читает её с диска."""
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    path = APP_DIR / "clip.png"
+    image.convert("RGB").save(path)
+    return path
+
+
+def grab_input(previous_hwnd, allow_image=False, timeout=0.8):
+    """Берёт то, с чем работать: выделенный текст или картинку из буфера.
 
     Пользователь выделяет текст и жмёт кнопку, не нажимая Ctrl+C, — значит,
     копируем за него: возвращаем фокус прежнему окну и посылаем ему Ctrl+C.
-    Если выделения не оказалось, возвращаем то, что уже лежало в буфере.
+
+    Буфер при этом не очищаем: иначе пропала бы картинка, скопированная
+    через Win+Shift+S. Понять, что появилось новое выделение, можно и так —
+    по тому, что содержимое буфера изменилось.
+
+    Возвращает пару: ("text", строка), ("image", картинка) или (None, None).
     """
-    previous_clipboard = pyperclip.paste()
-    pyperclip.copy("")
+    image = clipboard_image() if allow_image else None
+    before = pyperclip.paste()
 
     if previous_hwnd:
         _user32.SetForegroundWindow(previous_hwnd)
@@ -340,12 +415,15 @@ def grab_text(previous_hwnd, timeout=0.8):
     while time.monotonic() < deadline:
         time.sleep(0.05)
         selected = pyperclip.paste()
-        if selected.strip():
-            return selected
+        if selected.strip() and selected != before:
+            return "text", selected
 
-    # Выделения не было — возвращаем буфер как был и работаем с ним.
-    pyperclip.copy(previous_clipboard)
-    return previous_clipboard
+    # Нового выделения нет: работаем с тем, что уже лежало в буфере.
+    if image is not None:
+        return "image", image
+    if before.strip():
+        return "text", before
+    return None, None
 
 
 def save_ico():
@@ -380,6 +458,7 @@ class Conversation:
         self.action = action
         self.original = original
         self.last_result = ""
+        self.image_path = None  # задан, если обрабатываем картинку
 
 
 class App:
@@ -515,8 +594,9 @@ class App:
     # --- основной сценарий ------------------------------------------------
 
     def start_action(self, action):
+        allow_image = bool(action.get("images"))
         try:
-            text = grab_text(self.last_hwnd)
+            kind, content = grab_input(self.last_hwnd, allow_image=allow_image)
         except Exception as error:
             log.exception("Буфер обмена недоступен")
             ui.show_message(
@@ -525,9 +605,16 @@ class App:
             )
             return
 
+        if kind == "image":
+            self._start_image_action(action, content)
+            return
+
+        text = content
         if not isinstance(text, str) or not text.strip():
             if self.actions_window is not None and self.actions_window.winfo_exists():
-                self.actions_window.flash("Выделите текст в документе")
+                hint = ("Выделите текст или скопируйте картинку" if allow_image
+                        else "Выделите текст в документе")
+                self.actions_window.flash(hint)
             else:
                 ui.show_message(
                     self.root, "Буфер обмена пуст",
@@ -558,6 +645,35 @@ class App:
         prompt = build_first_prompt(action["prompt"], text)
         self._request(window, prompt, ui.plain(action["title"]))
 
+    def _start_image_action(self, action, image):
+        """Тот же сценарий, но исходник — картинка из буфера обмена."""
+        try:
+            path = save_clipboard_image(image)
+        except Exception as error:
+            log.exception("Не удалось сохранить картинку")
+            ui.show_message(
+                self.root, "Картинка",
+                f"Не удалось сохранить картинку из буфера: {error}", kind="error",
+            )
+            return
+
+        width, height = image.size
+        note = (
+            f"Картинка из буфера обмена, {width}×{height} точек.\n\n"
+            "Claude прочитает текст с картинки сам — результат появится ниже."
+        )
+        log.info("Картинка %d×%d, действие: %s", width, height, ui.plain(action["title"]))
+
+        conversation = Conversation(action, note)
+        conversation.image_path = path
+        window = ui.ResultWindow(self.root, action["title"], note, self.refine)
+        window.protocol("WM_DELETE_WINDOW", lambda w=window: self._close_window(w))
+        self.conversations[window] = conversation
+
+        window.set_busy()
+        prompt = build_image_prompt(action["prompt"], path)
+        self._request(window, prompt, ui.plain(action["title"]), image_path=path)
+
     def refine(self, window, note):
         conversation = self.conversations.get(window)
         if conversation is None:
@@ -568,10 +684,13 @@ class App:
             conversation.original,
             conversation.last_result,
             note,
+            image_path=conversation.image_path,
         )
-        self._request(window, prompt, "Доработка")
+        self._request(
+            window, prompt, "Доработка", image_path=conversation.image_path
+        )
 
-    def _request(self, window, prompt, label):
+    def _request(self, window, prompt, label, image_path=None):
         model = self.settings.get("model", "sonnet")
         timeout = int(self.settings.get("timeout_seconds", 60))
         self._set_busy(+1)
@@ -579,7 +698,7 @@ class App:
         def worker():
             started = time.monotonic()
             try:
-                result = run_claude(prompt, model, timeout)
+                result = run_claude(prompt, model, timeout, image_path=image_path)
                 log.info(
                     "%s: %d символов, модель %s, ответ за %.1f c",
                     label, len(prompt), model, time.monotonic() - started,
